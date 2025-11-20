@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Passport Photo PDF Creator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef } = React;
+
+    const PassportPhotoPDF = () => {
+      // constants for A4 layout
+      const PASSPORT_WIDTH_MM = 35;
+      const PASSPORT_HEIGHT_MM = 45;
+      const A4_WIDTH_MM = 210;
+      const A4_HEIGHT_MM = 297;
+      const DPI = 300;
+      const MM_TO_PX = DPI / 25.4;
+
+      // fixed grid to fit exactly 30: 5 columns x 6 rows
+      const PHOTOS_PER_ROW = 5;
+      const PHOTOS_PER_COL = 6;
+      const MAX_PHOTOS = PHOTOS_PER_ROW * PHOTOS_PER_COL; // 30
+
+      // compute equal gaps (space before, between and after)
+      const totalPhotoWidth = PHOTOS_PER_ROW * PASSPORT_WIDTH_MM;
+      const remainingH = Math.max(0, A4_WIDTH_MM - totalPhotoWidth);
+      const gapH = remainingH / (PHOTOS_PER_ROW + 1);
+
+      const totalPhotoHeight = PHOTOS_PER_COL * PASSPORT_HEIGHT_MM;
+      const remainingV = Math.max(0, A4_HEIGHT_MM - totalPhotoHeight);
+      const gapV = remainingV / (PHOTOS_PER_COL + 1);
+
+      const [items, setItems] = useState([]); // { id, src, copies, crop:{scale,x,y} }
+      const [activeId, setActiveId] = useState(null);
+      const [isDragging, setIsDragging] = useState(false);
+      const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+      const fileInputRefs = useRef({}); // map id -> ref
+
+      // helper to create a new item object
+      const createItem = (id, src) => ({
+        id,
+        src,
+        copies: 1,
+        crop: { scale: 1, x: 0, y: 0 }
+      });
+
+      const totalCopies = items.reduce((s, it) => s + Number(it.copies || 0), 0);
+
+      const addBlankItem = () => {
+        if (totalCopies >= MAX_PHOTOS) return;
+        const id = Date.now() + Math.random();
+        const newItems = [...items, createItem(id, null)];
+        setItems(newItems);
+      };
+
+      const triggerFile = (id) => {
+        if (!fileInputRefs.current[id]) fileInputRefs.current[id] = React.createRef();
+        fileInputRefs.current[id].current.click();
+      };
+
+      const handleFileSelect = (id, e) => {
+        const file = e.target.files[0];
+        if (!file || !file.type.startsWith('image/')) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          setItems(prev => prev.map(it => it.id === id ? { ...it, src: ev.target.result, crop: { scale: 1, x: 0, y: 0 } } : it));
+        };
+        reader.readAsDataURL(file);
+        e.target.value = '';
+      };
+
+      const replaceFile = (id) => triggerFile(id);
+
+      const removeItem = (id) => {
+        setItems(prev => prev.filter(it => it.id !== id));
+      };
+
+      const changeCopies = (id, val) => {
+        const v = Math.max(0, Math.min(MAX_PHOTOS, parseInt(val || 0)));
+        // ensure sum constraint: if setting this would exceed MAX_PHOTOS, clamp
+        const otherSum = items.reduce((s, it) => s + (it.id === id ? 0 : Number(it.copies || 0)), 0);
+        const allowed = Math.max(0, MAX_PHOTOS - otherSum);
+        const final = Math.min(v, allowed);
+        setItems(prev => prev.map(it => it.id === id ? { ...it, copies: final } : it));
+      };
+
+      const handleZoom = (id, delta) => {
+        setItems(prev => prev.map(it => it.id === id ? { ...it, crop: { ...it.crop, scale: Math.max(0.5, Math.min(3, it.crop.scale + delta)) } } : it));
+      };
+
+      const handleMouseDown = (e, id) => {
+        e.preventDefault();
+        setActiveId(id);
+        setIsDragging(true);
+        setDragStart({ x: e.clientX, y: e.clientY });
+      };
+
+      const handleMouseMove = (e) => {
+        if (!isDragging || activeId == null) return;
+        const dx = e.clientX - dragStart.x;
+        const dy = e.clientY - dragStart.y;
+        setItems(prev => prev.map(it => it.id === activeId ? { ...it, crop: { ...it.crop, x: it.crop.x + dx, y: it.crop.y + dy } } : it));
+        setDragStart({ x: e.clientX, y: e.clientY });
+      };
+
+      const handleMouseUp = () => {
+        setIsDragging(false);
+      };
+
+      // Generate ordered sequence: all copies of first photo, then all of second, ...
+      const buildSequence = () => {
+        const seq = [];
+        for (const it of items) {
+          if (!it.src || it.copies <= 0) continue;
+          for (let i = 0; i < it.copies; i++) seq.push(it);
+        }
+        // if fewer than MAX_PHOTOS fill remaining with nulls (optional)
+        return seq;
+      };
+
+      // PDF generation
+      const generatePDF = async () => {
+        if (items.length === 0 || totalCopies === 0) {
+          alert('Upload at least one photo and set copies (sum > 0).');
+          return;
+        }
+        const { jsPDF } = window.jspdf;
+        const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+        const sequence = buildSequence();
+        const totalCells = PHOTOS_PER_ROW * PHOTOS_PER_COL;
+
+        // iterate cells left-to-right, top-to-bottom
+        let idx = 0;
+        for (let r = 0; r < PHOTOS_PER_COL; r++) {
+          for (let c = 0; c < PHOTOS_PER_ROW; c++) {
+            if (idx >= sequence.length) break;
+            const item = sequence[idx];
+            if (!item || !item.src) {
+              idx++;
+              continue;
+            }
+
+            // compute x,y with equal gaps
+            const x = gapH + c * (PASSPORT_WIDTH_MM + gapH);
+            const y = gapV + r * (PASSPORT_HEIGHT_MM + gapV);
+
+            // draw image on offscreen canvas applying crop transform
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(PASSPORT_WIDTH_MM * MM_TO_PX);
+            canvas.height = Math.round(PASSPORT_HEIGHT_MM * MM_TO_PX);
+            const ctx = canvas.getContext('2d');
+
+            const img = new Image();
+            await new Promise((resolve) => {
+              img.onload = () => {
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                // Fit image to height, then apply scale and offsets (same logic as preview)
+                const baseHeight = canvas.height;
+                const baseWidth = (img.width / img.height) * baseHeight;
+
+                const finalWidth = baseWidth * item.crop.scale;
+                const finalHeight = baseHeight * item.crop.scale;
+
+                const centerX = canvas.width / 2;
+                const centerY = canvas.height / 2;
+                // crop.x/y were in pixels relative to preview; we used px as clientX/ clientY moves.
+                // We'll assume those px roughly match canvas pixels since preview size set proportional.
+                // To be safer, scale offsets from preview size (preview height was approx 360px). We used that earlier.
+                // We'll compute a scale factor between preview px and canvas px using previewHeightConst = 360
+                const previewHeightConst = 360; // matches preview div height in UI below
+                const offsetScale = canvas.height / previewHeightConst;
+
+                const offsetX = centerX - (finalWidth / 2) + (item.crop.x * offsetScale);
+                const offsetY = centerY - (finalHeight / 2) + (item.crop.y * offsetScale);
+
+                ctx.drawImage(img, offsetX, offsetY, finalWidth, finalHeight);
+                resolve();
+              };
+              img.src = item.src;
+            });
+
+            const imgData = canvas.toDataURL('image/jpeg', 0.95);
+            pdf.addImage(imgData, 'JPEG', x, y, PASSPORT_WIDTH_MM, PASSPORT_HEIGHT_MM, undefined, 'FAST');
+
+            idx++;
+          }
+          if (idx >= sequence.length) break;
+        }
+
+        pdf.save('passport-photos.pdf');
+      };
+
+      return (
+        <div className="min-h-screen bg-gray-50 p-6">
+          <div className="max-w-6xl mx-auto">
+            <h1 className="text-3xl font-bold text-center mb-4">Passport Photo PDF Creator</h1>
+            <p className="text-center text-sm text-gray-600 mb-6">A4 (5 × 6 grid = 30). Set copies per image and generate PDF ordered 111222333...</p>
+
+            <div className="flex gap-3 mb-4">
+              <button
+                onClick={addBlankItem}
+                disabled={totalCopies >= MAX_PHOTOS}
+                className="px-4 py-2 bg-indigo-600 text-white rounded disabled:bg-gray-300"
+              >
+                Add Photo
+              </button>
+              <div className="px-3 py-2 bg-white rounded shadow-sm flex items-center gap-4">
+                <span className="text-sm text-gray-700">Total copies:</span>
+                <strong>{totalCopies}/{MAX_PHOTOS}</strong>
+              </div>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-6 mb-8">
+              {items.map((it, index) => (
+                <div key={it.id} className="bg-white rounded-xl shadow p-4">
+                  <div className="flex justify-between items-center mb-2">
+                    <h3 className="font-semibold">Photo {index + 1}</h3>
+                    <div className="flex gap-2 items-center">
+                      <button onClick={() => replaceFile(it.id)} className="px-3 py-1 bg-gray-100 rounded">Replace</button>
+                      <button onClick={() => removeItem(it.id)} className="px-3 py-1 bg-red-100 text-red-700 rounded">Remove</button>
+                    </div>
+                  </div>
+
+                  {!it.src ? (
+                    <div
+                      onClick={() => triggerFile(it.id)}
+                      className="border-2 border-dashed rounded p-8 text-center cursor-pointer text-gray-500"
+                    >
+                      Click to upload
+                      <input
+                        ref={(el) => {
+                          if (!fileInputRefs.current[it.id]) fileInputRefs.current[it.id] = React.createRef();
+                          fileInputRefs.current[it.id].current = el;
+                        }}
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => handleFileSelect(it.id, e)}
+                        className="hidden"
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <div
+                        onMouseDown={(e) => handleMouseDown(e, it.id)}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onMouseLeave={handleMouseUp}
+                        className="relative bg-gray-100 rounded overflow-hidden mb-3 cursor-move"
+                        style={{ width: '280px', height: '360px', margin: '0 auto' }}
+                      >
+                        <img
+                          src={it.src}
+                          alt=""
+                          style={{
+                            position: 'absolute',
+                            left: '50%',
+                            top: '50%',
+                            height: '100%',
+                            width: 'auto',
+                            transform: `translate(-50%, -50%) translate(${it.crop.x}px, ${it.crop.y}px) scale(${it.crop.scale})`,
+                            transformOrigin: 'center',
+                            maxWidth: 'none'
+                          }}
+                        />
+                        <div className="absolute inset-0 border-4 border-indigo-400 pointer-events-none"></div>
+                      </div>
+
+                      <div className="flex items-center justify-center gap-3 mb-3">
+                        <button onClick={() => handleZoom(it.id, -0.1)} className="p-2 bg-gray-200 rounded">-</button>
+                        <span className="text-sm">{Math.round(it.crop.scale * 100)}%</span>
+                        <button onClick={() => handleZoom(it.id, 0.1)} className="p-2 bg-gray-200 rounded">+</button>
+                      </div>
+
+                      <div className="flex gap-2 items-center justify-center">
+                        <label className="text-sm">Copies:</label>
+                        <input
+                          type="number"
+                          min="0"
+                          max={MAX_PHOTOS}
+                          value={it.copies}
+                          onChange={(e) => changeCopies(it.id, e.target.value)}
+                          className="w-20 p-1 border rounded text-center"
+                        />
+                        <input
+                          ref={(el) => {
+                            if (!fileInputRefs.current[it.id]) fileInputRefs.current[it.id] = React.createRef();
+                            fileInputRefs.current[it.id].current = el;
+                          }}
+                          type="file"
+                          accept="image/*"
+                          onChange={(e) => handleFileSelect(it.id, e)}
+                          className="hidden"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="bg-white rounded-xl shadow p-6 text-center">
+              <p className="text-sm text-gray-600 mb-3">Preview & controls: drag to reposition, zoom to scale. PDF will be arranged evenly within A4.</p>
+              <button
+                onClick={generatePDF}
+                disabled={totalCopies === 0}
+                className="px-6 py-3 bg-indigo-600 text-white rounded disabled:bg-gray-300"
+              >
+                Generate PDF
+              </button>
+            </div>
+
+            <div className="mt-8 bg-white p-4 rounded shadow">
+              <h4 className="font-semibold mb-2">Notes</h4>
+              <ul className="text-sm text-gray-600 list-disc pl-5">
+                <li>Grid: {PHOTOS_PER_ROW} columns × {PHOTOS_PER_COL} rows = {MAX_PHOTOS} photos per A4.</li>
+                <li>Order: all copies of each photo are placed together (111222333...).</li>
+                <li>If total copies reach {MAX_PHOTOS} the Add Photo button is disabled.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    ReactDOM.render(<PassportPhotoPDF />, document.getElementById('root'));
+  </script>
+</body>
+</html>
